@@ -252,13 +252,17 @@ def filter_candidates_by_metadata(query: str, candidates: list[dict[str, Any]], 
     if not any(metadata.values()):
         return candidates[:top_k]
 
+    inferred_keys = [key for key, value in metadata.items() if value is not None]
+    if not any(candidate.get(key) for candidate in candidates for key in inferred_keys):
+        return candidates[:top_k]
+
     scored = []
     for candidate in candidates:
-        candidate_fields = {key: (candidate.get(key) or "").lower() for key in metadata if metadata[key] is not None}
-        matches = sum(1 for key, expected in metadata.items() if expected is not None and candidate_fields.get(key, "") == expected)
+        candidate_fields = {key: (candidate.get(key) or "").lower() for key in inferred_keys}
+        matches = sum(1 for key in inferred_keys if candidate_fields.get(key, "") == metadata[key])
         scored.append((matches, candidate))
 
-    scored.sort(key=lambda item: (-item[0], item[1].get("id", "")))
+    scored.sort(key=lambda item: -item[0])
     return [candidate for _, candidate in scored[:top_k]]
 
 
@@ -325,6 +329,48 @@ def retrieve_top_k(
     return rerank_candidates(query_text or "", filtered, top_k=top_k)
 
 
+def evaluate_retrieval_variants(
+    query: str,
+    index_path: str | Path,
+    metadata_path: str | Path,
+    query_vector: list[float] | np.ndarray | None = None,
+    top_k: int = 4,
+    model_path: str | None = None,
+) -> dict[str, Any]:
+    if query_vector is None:
+        if model_path is None:
+            raise ValueError("Either query_vector or model_path is required")
+        query_vector = embed_query(query, model_path=model_path)
+
+    query_array = np.asarray(query_vector, dtype="float32")
+    if query_array.ndim == 1:
+        query_array = query_array.reshape(1, -1)
+    else:
+        query_array = query_array.reshape(1, -1)
+
+    index = faiss.read_index(str(index_path))
+    with open(metadata_path, encoding="utf-8") as handle:
+        metadata = json.load(handle)
+
+    faiss.normalize_L2(query_array)
+    _, indices = index.search(query_array, min(top_k * 4, len(metadata)))
+    raw_results = []
+    for idx in indices[0]:
+        if idx == -1:
+            continue
+        raw_results.append(metadata[int(idx)])
+
+    filtered = filter_candidates_by_metadata(query, raw_results, top_k=top_k)
+    reranked = rerank_candidates(query, filtered, top_k=top_k)
+    return {
+        "query": query,
+        "raw_ids": [chunk.get("id") for chunk in raw_results[:top_k]],
+        "reranked_ids": [chunk.get("id") for chunk in reranked],
+        "raw_results": raw_results[:top_k],
+        "reranked_results": reranked,
+    }
+
+
 def generate_answer(query: str, context_chunks: list[dict[str, Any]], model_path: str, max_tokens: int = 220) -> str:
     if not context_chunks:
         raise ValueError("At least one context chunk is required")
@@ -355,6 +401,8 @@ def main():
     parser.add_argument("--query", default=None, help="Optional query to retrieve context and generate an answer")
     parser.add_argument("--top-k", type=int, default=4, help="Number of retrieved chunks to include")
     parser.add_argument("--max-chunks", type=int, default=None, help="Optional limit for indexing only the first N chunks")
+    parser.add_argument("--evaluate", action="store_true", help="Compare raw FAISS and reranked retrieval for the test prompts")
+    parser.add_argument("--prompts", default="metadata.json", help="JSON file containing a test_prompts list (used with --evaluate)")
     args = parser.parse_args()
 
     chunks_path = Path(args.chunks)
@@ -385,7 +433,24 @@ def main():
     print(f"FAISS index: {index_path}")
     print(f"Metadata:    {metadata_path}")
 
-    if args.query:
+    if args.evaluate:
+        prompts_path = Path(args.prompts)
+        if not prompts_path.exists():
+            print(f"Prompts file not found: {prompts_path}", file=sys.stderr)
+            sys.exit(1)
+        with open(prompts_path, encoding="utf-8") as handle:
+            prompts_config = json.load(handle)
+        test_prompts = prompts_config.get("test_prompts", []) if isinstance(prompts_config, dict) else []
+        if not test_prompts:
+            print(f"No test_prompts found in {prompts_path}", file=sys.stderr)
+            sys.exit(1)
+        for item in test_prompts:
+            result = evaluate_retrieval_variants(item["prompt"], index_path, metadata_path, top_k=args.top_k, model_path=args.model)
+            print(f"PROMPT: {item['prompt']}")
+            print(f"  raw: {result['raw_ids']}")
+            print(f"  reranked: {result['reranked_ids']}")
+            print()
+    elif args.query:
         query_vector = embed_query(args.query, model_path=args.model, server_url=args.server)
         retrieved = retrieve_top_k(index_path, metadata_path, query_vector, top_k=args.top_k, query_text=args.query)
         answer = generate_answer(args.query, retrieved, model_path=args.model)
@@ -394,4 +459,7 @@ def main():
             print(f"- {chunk.get('source')} page {chunk.get('page')}")
         print("\nAnswer:")
         print(answer)
+    
+
+if __name__ == "__main__":
     main()

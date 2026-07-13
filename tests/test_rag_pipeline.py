@@ -99,6 +99,55 @@ class RetrievalPipelineTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in filtered], ["chunk-b"])
 
+    def test_filter_preserves_order_for_production_shaped_chunks(self):
+        # Real corpus/chunks.json chunks only have id/source/page/text — no
+        # crop/topic/region fields. The filter must not rescore and reorder
+        # such candidates (a zero-match tie previously re-sorted them by id,
+        # discarding FAISS's similarity ranking).
+        query = "maize soil preparation"
+        candidates = [
+            {"id": "z_chunk", "source": "maize production.pdf", "page": 3, "text": "maize soil preparation"},
+            {"id": "m_chunk", "source": "maize production.pdf", "page": 7, "text": "maize planting dates"},
+            {"id": "a_chunk", "source": "vegprodnutshell-daff.pdf", "page": 1, "text": "vegetable production overview"},
+        ]
+
+        filtered = embed_and_index.filter_candidates_by_metadata(query, candidates, top_k=2)
+
+        self.assertEqual([item["id"] for item in filtered], ["z_chunk", "m_chunk"])
+
+    def test_evaluate_retrieval_variants_reports_raw_and_reranked_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            index_path = tmp_path / "test.faiss"
+            metadata_path = tmp_path / "metadata.json"
+
+            vectors = np.array(
+                [[1.0, 0.0], [0.0, 1.0], [0.2, 0.8]],
+                dtype="float32",
+            )
+            index = faiss.IndexFlatIP(vectors.shape[1])
+            index.add(vectors)
+            faiss.write_index(index, str(index_path))
+
+            metadata = [
+                {"id": "chunk-a", "crop": "potato", "topic": "disease", "region": "kenya", "text": "potato disease control"},
+                {"id": "chunk-b", "crop": "maize", "topic": "soil preparation", "region": "south africa", "text": "maize soil preparation"},
+                {"id": "chunk-c", "crop": "maize", "topic": "planting", "region": "south africa", "text": "maize planting guide"},
+            ]
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            query_vector = np.array([[0.95, 0.05]], dtype="float32")
+            result = embed_and_index.evaluate_retrieval_variants(
+                "maize soil prep",
+                index_path,
+                metadata_path,
+                query_vector=query_vector,
+                top_k=2,
+            )
+
+            self.assertEqual(result["raw_ids"][0], "chunk-a")
+            self.assertEqual(result["reranked_ids"][0], "chunk-b")
+
 
 if __name__ == "__main__":
     unittest.main()
