@@ -2,3 +2,5 @@
 corpus/*_metadata.json
 corpus/raw/
 model/
+__pycache__/
+*.pyc
