@@ -214,6 +214,54 @@ def _normalize_query_terms(query: str) -> set[str]:
     return expanded
 
 
+def infer_query_metadata(query: str) -> dict[str, str | None]:
+    query_text = query.lower()
+    crop_keywords = {
+        "maize": "maize",
+        "corn": "maize",
+        "wheat": "wheat",
+        "rice": "rice",
+        "soy": "soy",
+        "soybean": "soy",
+        "cassava": "cassava",
+        "sorghum": "sorghum",
+    }
+    topic_keywords = {
+        "soil preparation": "soil preparation",
+        "soil prep": "soil preparation",
+        "fertilizer": "fertilizer",
+        "irrigation": "irrigation",
+        "pest control": "pest control",
+        "planting": "planting",
+        "harvesting": "harvesting",
+        "storage": "storage",
+    }
+
+    crop = next((value for key, value in crop_keywords.items() if key in query_text), None)
+    topic = next((value for key, value in topic_keywords.items() if key in query_text), None)
+    region = None
+    for phrase in ["south africa", "kenya", "uganda", "tanzania", "ethiopia", "nigeria", "ghana"]:
+        if phrase in query_text:
+            region = phrase
+            break
+    return {"crop": crop, "topic": topic, "region": region}
+
+
+def filter_candidates_by_metadata(query: str, candidates: list[dict[str, Any]], top_k: int = 4) -> list[dict[str, Any]]:
+    metadata = infer_query_metadata(query)
+    if not any(metadata.values()):
+        return candidates[:top_k]
+
+    scored = []
+    for candidate in candidates:
+        candidate_fields = {key: (candidate.get(key) or "").lower() for key in metadata if metadata[key] is not None}
+        matches = sum(1 for key, expected in metadata.items() if expected is not None and candidate_fields.get(key, "") == expected)
+        scored.append((matches, candidate))
+
+    scored.sort(key=lambda item: (-item[0], item[1].get("id", "")))
+    return [candidate for _, candidate in scored[:top_k]]
+
+
 def rerank_candidates(
     query: str,
     candidates: list[dict[str, Any]],
@@ -233,7 +281,15 @@ def rerank_candidates(
         exact_phrase_bonus = 1 if query.lower() in text else 0
         source_bonus = 1 if any(term in source for term in query_terms) else 0
         vector_score = vector_scores[index] if vector_scores and index < len(vector_scores) else 0.0
-        score = overlap * 3 + exact_phrase_bonus + source_bonus + vector_score
+        metadata = infer_query_metadata(query)
+        metadata_bonus = 0
+        for key, expected in metadata.items():
+            if expected is None:
+                continue
+            candidate_value = (candidate.get(key) or "").lower()
+            if candidate_value == expected:
+                metadata_bonus += 1
+        score = overlap * 3 + exact_phrase_bonus + source_bonus + metadata_bonus + vector_score
         scored.append((score, candidate))
 
     scored.sort(key=lambda item: (-item[0], item[1].get("id", "")))
@@ -265,7 +321,8 @@ def retrieve_top_k(
         if idx == -1:
             continue
         results.append(metadata[int(idx)])
-    return rerank_candidates(query_text or "", results, top_k=top_k)
+    filtered = filter_candidates_by_metadata(query_text or "", results, top_k=top_k)
+    return rerank_candidates(query_text or "", filtered, top_k=top_k)
 
 
 def generate_answer(query: str, context_chunks: list[dict[str, Any]], model_path: str, max_tokens: int = 220) -> str:

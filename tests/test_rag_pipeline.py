@@ -81,6 +81,24 @@ class RetrievalPipelineTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in reranked], ["chunk-b"])
 
+    def test_infer_query_metadata_extracts_explicit_fields(self):
+        inferred = embed_and_index.infer_query_metadata("maize soil preparation in south africa")
+
+        self.assertEqual(inferred["crop"], "maize")
+        self.assertEqual(inferred["topic"], "soil preparation")
+        self.assertEqual(inferred["region"], "south africa")
+
+    def test_filter_candidates_by_metadata_prefers_matching_chunks(self):
+        query = "maize soil preparation in south africa"
+        candidates = [
+            {"id": "chunk-a", "crop": "wheat", "topic": "pest control", "region": "kenya", "text": "wheat pest control"},
+            {"id": "chunk-b", "crop": "maize", "topic": "soil preparation", "region": "south africa", "text": "maize soil preparation"},
+        ]
+
+        filtered = embed_and_index.filter_candidates_by_metadata(query, candidates, top_k=1)
+
+        self.assertEqual([item["id"] for item in filtered], ["chunk-b"])
+
 
 if __name__ == "__main__":
     unittest.main()
