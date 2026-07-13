@@ -59,6 +59,17 @@ class RetrievalPipelineTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in reranked], ["chunk-z"])
 
+    def test_rerank_combines_dense_and_lexical_scores(self):
+        query = "maize soil prep"
+        candidates = [
+            {"id": "chunk-a", "text": "tomato disease control"},
+            {"id": "chunk-b", "text": "maize soil preparation and planting"},
+        ]
+
+        reranked = embed_and_index.rerank_candidates(query, candidates, top_k=2, vector_scores=[0.95, 0.80])
+
+        self.assertEqual([item["id"] for item in reranked], ["chunk-b", "chunk-a"])
+
 
 if __name__ == "__main__":
     unittest.main()

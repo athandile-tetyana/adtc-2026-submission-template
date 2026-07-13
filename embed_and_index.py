@@ -214,18 +214,24 @@ def _normalize_query_terms(query: str) -> set[str]:
     return expanded
 
 
-def rerank_candidates(query: str, candidates: list[dict[str, Any]], top_k: int = 4) -> list[dict[str, Any]]:
+def rerank_candidates(
+    query: str,
+    candidates: list[dict[str, Any]],
+    top_k: int = 4,
+    vector_scores: list[float] | None = None,
+) -> list[dict[str, Any]]:
     query_terms = _normalize_query_terms(query)
     if not query_terms:
         return candidates[:top_k]
 
     scored = []
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates):
         text = (candidate.get("text") or "").lower()
         terms = set(re.findall(r"[a-z0-9]+", text))
         overlap = len(query_terms & terms)
         exact_phrase_bonus = 1 if query.lower() in text else 0
-        score = overlap * 3 + exact_phrase_bonus
+        vector_score = vector_scores[index] if vector_scores and index < len(vector_scores) else 0.0
+        score = overlap * 3 + exact_phrase_bonus + vector_score
         scored.append((score, candidate))
 
     scored.sort(key=lambda item: (-item[0], item[1].get("id", "")))
