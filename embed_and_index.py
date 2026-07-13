@@ -427,35 +427,43 @@ def main():
     parser.add_argument("--max-chunks", type=int, default=None, help="Optional limit for indexing only the first N chunks")
     parser.add_argument("--evaluate", action="store_true", help="Compare raw FAISS and reranked retrieval for the test prompts")
     parser.add_argument("--prompts", default="metadata.json", help="JSON file containing a test_prompts list (used with --evaluate)")
+    parser.add_argument("--rebuild", action="store_true", help="Re-embed and rebuild the index even if --index and --metadata already exist")
     args = parser.parse_args()
-
-    chunks_path = Path(args.chunks)
-    if not chunks_path.exists():
-        print(f"Chunks file not found: {chunks_path}", file=sys.stderr)
-        sys.exit(1)
-
-    chunks = load_chunks(chunks_path)
-    if not chunks:
-        print("No chunks found in input file.", file=sys.stderr)
-        sys.exit(1)
-    if args.max_chunks is not None:
-        chunks = chunks[: args.max_chunks]
 
     if args.model is None and args.server is None:
         print("Either --model or --server must be provided.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Building embeddings for {len(chunks)} chunks...")
-    index_path, metadata_path = build_index_from_chunks(
-        chunks,
-        model_path=args.model,
-        server_url=args.server,
-        index_path=args.index,
-        metadata_path=args.metadata,
-    )
-    print(f"Indexed {len(chunks)} chunks")
-    print(f"FAISS index: {index_path}")
-    print(f"Metadata:    {metadata_path}")
+    index_path = Path(args.index)
+    metadata_path = Path(args.metadata)
+
+    if args.rebuild or not (index_path.exists() and metadata_path.exists()):
+        chunks_path = Path(args.chunks)
+        if not chunks_path.exists():
+            print(f"Chunks file not found: {chunks_path}", file=sys.stderr)
+            sys.exit(1)
+
+        chunks = load_chunks(chunks_path)
+        if not chunks:
+            print("No chunks found in input file.", file=sys.stderr)
+            sys.exit(1)
+        if args.max_chunks is not None:
+            chunks = chunks[: args.max_chunks]
+
+        print(f"Building embeddings for {len(chunks)} chunks...")
+        index_path, metadata_path = build_index_from_chunks(
+            chunks,
+            model_path=args.model,
+            server_url=args.server,
+            index_path=index_path,
+            metadata_path=metadata_path,
+        )
+        print(f"Indexed {len(chunks)} chunks")
+        print(f"FAISS index: {index_path}")
+        print(f"Metadata:    {metadata_path}")
+    else:
+        print(f"Using existing FAISS index: {index_path} (pass --rebuild to re-embed)")
+        print(f"Using existing metadata:    {metadata_path}")
 
     if args.evaluate:
         prompts_path = Path(args.prompts)
