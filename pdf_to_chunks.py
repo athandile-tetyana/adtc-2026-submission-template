@@ -217,6 +217,29 @@ def split_text_with_overlap(
     return [chunk for chunk in chunks if chunk]
 
 
+def clean_chunk_text(text: str) -> str:
+    """Remove obvious boilerplate and repetitive noise from a chunk before indexing."""
+    cleaned = re.sub(r"[ \t]+", " ", text).strip()
+    if not cleaned:
+        return ""
+
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    lines = [line for line in lines if not re.fullmatch(r"(?:page|p\.)\s*\d+", line, flags=re.I)]
+    lines = [line for line in lines if not re.fullmatch(r"(?:department|republic|ministry|government)\s*[:\-].*", line, flags=re.I)]
+    lines = [line for line in lines if not re.fullmatch(r"(?:agriculture|south africa|cape town|pretoria|republic of south africa)", line, flags=re.I)]
+    lines = [line for line in lines if not re.search(r"\brepublic\b", line, flags=re.I)]
+
+    filtered: list[str] = []
+    for line in lines:
+        if not filtered or filtered[-1].lower() != line.lower():
+            filtered.append(line)
+
+    cleaned = "\n".join(filtered).strip()
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"\n+", "\n", cleaned)
+    return cleaned.strip()
+
+
 def enforce_size_limits(sections: list[str]) -> list[str]:
     """
     Two cleanup passes over the heading-based sections:
@@ -225,8 +248,11 @@ def enforce_size_limits(sections: list[str]) -> list[str]:
       2. Anything under MIN_CHUNK_CHARS gets merged into the previous chunk
          only when the combined size still fits safely inside the limit.
     """
+    cleaned_sections = [clean_chunk_text(section) for section in sections]
+    cleaned_sections = [section for section in cleaned_sections if section and len(section) >= 40]
+
     sized: list[str] = []
-    for section in sections:
+    for section in cleaned_sections:
         if len(section) <= MAX_CHUNK_CHARS:
             sized.append(section)
             continue
@@ -251,7 +277,7 @@ def enforce_size_limits(sections: list[str]) -> list[str]:
         else:
             final.extend(split_text_with_overlap(chunk))
 
-    return final
+    return [chunk for chunk in final if chunk and len(chunk) >= 40]
 
 
 def chunk_pdf(pdf_path: Path) -> list[dict]:
