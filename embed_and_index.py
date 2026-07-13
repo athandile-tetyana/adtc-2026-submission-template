@@ -227,11 +227,13 @@ def rerank_candidates(
     scored = []
     for index, candidate in enumerate(candidates):
         text = (candidate.get("text") or "").lower()
+        source = (candidate.get("source") or "").lower()
         terms = set(re.findall(r"[a-z0-9]+", text))
         overlap = len(query_terms & terms)
         exact_phrase_bonus = 1 if query.lower() in text else 0
+        source_bonus = 1 if any(term in source for term in query_terms) else 0
         vector_score = vector_scores[index] if vector_scores and index < len(vector_scores) else 0.0
-        score = overlap * 3 + exact_phrase_bonus + vector_score
+        score = overlap * 3 + exact_phrase_bonus + source_bonus + vector_score
         scored.append((score, candidate))
 
     scored.sort(key=lambda item: (-item[0], item[1].get("id", "")))

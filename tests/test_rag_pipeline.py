@@ -70,6 +70,17 @@ class RetrievalPipelineTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in reranked], ["chunk-b", "chunk-a"])
 
+    def test_rerank_boosts_matches_from_relevant_sources(self):
+        query = "maize soil prep"
+        candidates = [
+            {"id": "chunk-a", "source": "vegetables.pdf", "text": "soil preparation for vegetables"},
+            {"id": "chunk-b", "source": "maize production.pdf", "text": "soil preparation and planting"},
+        ]
+
+        reranked = embed_and_index.rerank_candidates(query, candidates, top_k=1)
+
+        self.assertEqual([item["id"] for item in reranked], ["chunk-b"])
+
 
 if __name__ == "__main__":
     unittest.main()
