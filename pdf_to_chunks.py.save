@@ -2,6 +2,7 @@
 pdf_to_chunks.py — ADTC 2026 Agriculture RAG: corpus extraction + chunking
 
 WHAT THIS DOES (plain English version, for explaining to your brother):
+ source /workspaces/adtc-2026-submission-template/.venv/bin/activate
   You point it at a folder of agriculture PDFs. It reads each one, pulls out
   the raw text, and cuts that text into bite-sized "chunks" — small enough
   that the model can actually read one at inference time, but big enough
@@ -33,19 +34,16 @@ from pypdf import PdfReader
 
 # --- Config -----------------------------------------------------------------
 
-# Max characters per chunk. We keep this conservative because the embedding
-# server is stricter than the model context window, and we want each chunk to
-# stay comfortably below the server's token safety limit on an 8GB laptop.
-MAX_CHUNK_CHARS = 1300
+# Max characters per chunk. Kept small on purpose: at inference time these
+# chunks get stuffed into the model's context window alongside the user's
+# question and the model's own reasoning. On an 8GB laptop with a 512-2048
+# token context, you can't afford 3000-character chunks eating the budget.
+MAX_CHUNK_CHARS = 1200
 
 # Minimum chunk size — anything shorter than this gets merged into the
 # next chunk instead of being retrieved on its own (a 2-line orphan chunk
 # with no context is useless to the model).
-MIN_CHUNK_CHARS = 250
-
-# Overlap is kept small but meaningful so adjacent chunks share context
-# without making the next chunk too large for the embedding endpoint.
-OVERLAP_CHARS = 180
+MIN_CHUNK_CHARS = 200
 
 # Headings in these government/ARC guides are typically ALL CAPS lines,
 # or short lines (under ~60 chars) ending without a period, often followed
@@ -105,153 +103,77 @@ def split_into_sections(page_text: str) -> list[str]:
     return [s for s in sections if s]
 
 
-def _split_long_text(text: str, max_chars: int) -> list[str]:
-    """Split a long paragraph into chunks without cutting mid-sentence."""
-    text = re.sub(r"[ \t]+", " ", text).strip()
-    if not text:
-        return []
-    if len(text) <= max_chars:
-        return [text]
-
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-    if len(sentences) > 1:
-        chunks: list[str] = []
-        current = ""
-        for sentence in sentences:
-            candidate = f"{current} {sentence}".strip() if current else sentence
-            if len(candidate) <= max_chars:
-                current = candidate
-                continue
-            if current:
-                chunks.append(current)
-            current = sentence
-        if current:
-            chunks.append(current)
-        return [chunk for chunk in chunks if chunk]
-
-    words = text.split()
-    if len(words) <= 1:
-        return [text[:max_chars]]
-
+def _hard_split(text: str) -> list[str]:
+    """
+    Last-resort splitter for text with no paragraph breaks to split on
+    (continuous single-newline text, common when a PDF's layout doesn't
+    produce blank lines during extraction). Splits on sentence boundaries
+    instead, so we still avoid cutting mid-sentence even without paragraph
+    structure to lean on.
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", text)
     chunks = []
-    current = ""
-    for word in words:
-        candidate = f"{current} {word}".strip() if current else word
-        if len(candidate) <= max_chars:
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-        current = word
-    if current:
-        chunks.append(current)
-    return [chunk for chunk in chunks if chunk]
-
-
-def split_text_with_overlap(
-    text: str,
-    max_chars: int = MAX_CHUNK_CHARS,
-    overlap_chars: int = OVERLAP_CHARS,
-) -> list[str]:
-    """
-    Split plain text into smaller chunks with a small overlap.
-
-    The splitter prefers paragraph boundaries, falls back to sentence
-    boundaries for very long paragraphs, and keeps each chunk comfortably
-    under the embedding endpoint's safe size.
-    """
-    normalized = re.sub(r"[ \t]+", " ", text).strip()
-    if not normalized:
-        return []
-    if len(normalized) <= max_chars:
-        return [normalized]
-
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", normalized) if p.strip()]
-    if not paragraphs:
-        paragraphs = [normalized]
-
-    chunks: list[str] = []
-    current = ""
-    previous_tail = ""
-
-    for paragraph in paragraphs:
-        if len(paragraph) > max_chars:
-            if current:
-                chunks.append(current.strip())
-                previous_tail = chunks[-1][-overlap_chars:] if overlap_chars else ""
-                current = ""
-            child_chunks = _split_long_text(paragraph, max_chars)
-            if child_chunks:
-                chunks.extend(child_chunks)
-                previous_tail = child_chunks[-1][-overlap_chars:] if overlap_chars else ""
-            continue
-
-        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
-        if len(candidate) <= max_chars:
-            current = candidate
-            continue
-
-        if current:
-            chunks.append(current.strip())
-            previous_tail = chunks[-1][-overlap_chars:] if overlap_chars else ""
-
-        overlap = previous_tail
-        if overlap and len(overlap) + len(paragraph) + 2 > max_chars:
-            overlap = overlap[-max(40, max_chars // 4):]
-
-        candidate = f"{overlap}\n\n{paragraph}".strip() if overlap else paragraph
-        if len(candidate) > max_chars:
-            split_chunks = _split_long_text(candidate, max_chars)
-            if split_chunks:
-                chunks.extend(split_chunks[:-1])
-                current = split_chunks[-1].strip()
-                previous_tail = current[-overlap_chars:] if overlap_chars else ""
-                continue
-            current = candidate[:max_chars].strip()
+    buf = ""
+    for sentence in sentences:
+        if len(buf) + len(sentence) + 1 <= MAX_CHUNK_CHARS:
+            buf = f"{buf} {sentence}".strip()
         else:
-            current = candidate
-
-    if current:
-        chunks.append(current.strip())
-
-    return [chunk for chunk in chunks if chunk]
+            if buf:
+                chunks.append(buf)
+            buf = sentence
+    if buf:
+        chunks.append(buf)
+    return chunks
 
 
 def enforce_size_limits(sections: list[str]) -> list[str]:
     """
     Two cleanup passes over the heading-based sections:
       1. Anything over MAX_CHUNK_CHARS gets split further, on paragraph
-         breaks where possible, so we never blow the embedding budget.
-      2. Anything under MIN_CHUNK_CHARS gets merged into the previous chunk
-         only when the combined size still fits safely inside the limit.
+         breaks where possible, so we never blow the context budget.
+      2. Anything under MIN_CHUNK_CHARS gets merged into the chunk before
+         it, so retrieval never returns a near-empty fragment.
     """
-    sized: list[str] = []
+    # Pass 1: split oversized sections on paragraph boundaries
+    sized = []
     for section in sections:
         if len(section) <= MAX_CHUNK_CHARS:
             sized.append(section)
             continue
-        sized.extend(split_text_with_overlap(section))
-
-    merged: list[str] = []
-    for chunk in sized:
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        if merged and len(chunk) < MIN_CHUNK_CHARS:
-            combined = f"{merged[-1]}\n\n{chunk}".strip()
-            if len(combined) <= MAX_CHUNK_CHARS:
-                merged[-1] = combined
+        paragraphs = section.split("\n\n")
+        buf = ""
+        for para in paragraphs:
+            # A single "paragraph" can itself exceed MAX_CHUNK_CHARS when the
+            # source PDF has no blank-line breaks at all (continuous text,
+            # one newline per line). Without this guard, such a paragraph
+            # sails through untouched and never gets chunked - this is what
+            # produced the 5000-char blob from Brochure Fruit vegetables.pdf.
+            # Fall back to a hard split on sentence boundaries when a single
+            # paragraph alone is too big.
+            if len(para) > MAX_CHUNK_CHARS:
+                if buf:
+                    sized.append(buf)
+                    buf = ""
+                sized.extend(_hard_split(para))
                 continue
-        merged.append(chunk)
+            if len(buf) + len(para) + 2 <= MAX_CHUNK_CHARS:
+                buf = f"{buf}\n\n{para}".strip()
+            else:
+                if buf:
+                    sized.append(buf)
+                buf = para
+        if buf:
+            sized.append(buf)
 
-    final: list[str] = []
-    for chunk in merged:
-        if len(chunk) <= MAX_CHUNK_CHARS:
-            final.append(chunk)
+    # Pass 2: merge undersized chunks forward into their neighbor
+    merged = []
+    for chunk in sized:
+        if merged and len(chunk) < MIN_CHUNK_CHARS:
+            merged[-1] = f"{merged[-1]}\n\n{chunk}"
         else:
-            final.extend(split_text_with_overlap(chunk))
+            merged.append(chunk)
 
-    return final
+    return merged
 
 
 def chunk_pdf(pdf_path: Path) -> list[dict]:

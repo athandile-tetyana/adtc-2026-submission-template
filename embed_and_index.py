@@ -1,42 +1,21 @@
 """
 embed_and_index.py — ADTC 2026 Agriculture RAG: embed chunks + build FAISS index
 
-WHAT THIS DOES (plain English version):
-  Takes the chunks.json from pdf_to_chunks.py, sends each chunk's text to
-  your running llama-server (the --embedding one you already tested with
-  curl), and gets back a vector — a list of numbers that represents the
-  *meaning* of that chunk. It stacks all those vectors into a FAISS index,
-  which is basically a fast "find me the most similar vectors" lookup
-  structure. Alongside the index, it saves a small JSON file mapping each
-  vector's position back to the original chunk text and metadata, because
-  FAISS itself only knows positions/numbers, not what they mean.
+This script now supports both:
+  1. the existing server-based embedding flow via llama-server, and
+  2. a fully local offline flow using llama-cpp-python and the GGUF model.
 
-  At query time (the next script, not this one): you embed the user's
-  question the same way, ask FAISS for the closest chunk vectors, and feed
-  those chunks' original text into the model as context. That's the "R" in
-  RAG — retrieval before generation.
-
-WHY THIS STAYS LLAMA.CPP-ONLY:
-  Embeddings come from your own tiny-aya-earth-q4_k_m.gguf via llama-server's
-  /embedding endpoint — no torch, no sentence-transformers, no second model.
-  Same runtime end to end, which matters for the ADTC "llama.cpp only" rule
-  and keeps your dependency footprint (and RAM budget) small.
-
-PREREQUISITE:
-  llama-server must already be running with --embedding, e.g.:
-    ~/llama.cpp/build/bin/llama-server -m model/tiny-aya-earth-q4_k_m.gguf \
-        --embedding -c 512 --port 8080
-
-USAGE:
-  python embed_and_index.py --chunks corpus/chunks.json \
-      --index corpus/index.faiss --metadata corpus/metadata.json
+It can build a FAISS index, retrieve the most relevant chunks for a query,
+and generate an answer from those chunks using the same local model.
 """
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import requests
@@ -47,76 +26,140 @@ except ImportError:
     print("faiss not installed. Run: pip install faiss-cpu", file=sys.stderr)
     sys.exit(1)
 
+try:
+    from llama_cpp import Llama
+except ImportError:  # pragma: no cover - optional dependency
+    Llama = None
 
-def get_embedding(server_url: str, text: str, retries: int = 3) -> list[float]:
-    """
-    Post one chunk's text to llama-server's /embedding endpoint and return
-    the vector. Retries on transient failures (e.g. server still warming up
-    a batch) since these can happen mid-run on constrained hardware, not
-    just at startup.
 
-    Note on the response shape: llama-server returns a nested list —
-    [{"index": 0, "embedding": [[...]]}]. The outer list is per-request,
-    the inner one is per-token-position for some modes, but with a single
-    short prompt and pooling enabled you get one row back. We grab that
-    row directly rather than assuming a flat list, since the exact nesting
-    has changed across llama.cpp versions.
-    """
+def wait_for_server_ready(server_url: str, timeout: int = 300, interval: int = 2) -> None:
+    """Poll the llama.cpp health endpoint until the embedding server is ready."""
+    health_url = f"{server_url}/health"
+    deadline = time.time() + timeout
+    last_error = "unknown"
+
+    while time.time() < deadline:
+        try:
+            response = requests.get(health_url, timeout=10)
+            if response.status_code == 200:
+                return
+            last_error = f"{response.status_code}: {response.text.strip()}"
+        except requests.RequestException as exc:
+            last_error = str(exc)
+
+        time.sleep(interval)
+
+    raise RuntimeError(f"Embedding server did not become ready: {last_error}")
+
+
+def get_embedding(server_url: str, text: str, retries: int = 6) -> list[float]:
+    """Get an embedding from a llama-server /embedding endpoint."""
     for attempt in range(retries):
         try:
             resp = requests.post(
                 f"{server_url}/embedding",
                 json={"content": text},
-                # 90s, not 30s: server logs show single requests taking
-                # 20-30s on Codespace's shared CPU even for a mid-size
-                # chunk. 30s was cutting off requests that were slow but
-                # still working, not actually stuck.
-                timeout=90,
+                timeout=180,
             )
             resp.raise_for_status()
             data = resp.json()
             embedding = data[0]["embedding"]
-            # Unwrap one level of nesting if present (see docstring above).
             if isinstance(embedding[0], list):
                 embedding = embedding[0]
             return embedding
-        except (requests.RequestException, KeyError, IndexError) as e:
+        except (requests.RequestException, KeyError, IndexError) as exc:
             if attempt == retries - 1:
-                raise RuntimeError(
-                    f"Failed to embed after {retries} attempts: {e}"
-                ) from e
-            time.sleep(1.5 * (attempt + 1))  # brief backoff before retry
+                raise RuntimeError(f"Failed to embed after {retries} attempts: {exc}") from exc
+            time.sleep(2.0 * (attempt + 1))
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--chunks", required=True, help="Path to chunks.json")
-    parser.add_argument("--index", required=True, help="Output path for FAISS index")
-    parser.add_argument("--metadata", required=True, help="Output path for chunk metadata JSON")
-    parser.add_argument("--server", default="http://localhost:8080", help="llama-server base URL")
-    args = parser.parse_args()
+def build_embedding_model(model_path: str, n_threads: int | None = None) -> Any:
+    if Llama is None:
+        raise RuntimeError("llama-cpp-python is not installed. Install it to use the offline flow.")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    threads = n_threads or max(1, min(4, os.cpu_count() or 1))
+    return Llama(model_path=model_path, embedding=True, n_ctx=512, n_threads=threads, verbose=False)
 
-    chunks_path = Path(args.chunks)
-    if not chunks_path.exists():
-        print(f"Chunks file not found: {chunks_path}", file=sys.stderr)
-        sys.exit(1)
 
-    with open(chunks_path, encoding="utf-8") as f:
-        chunks = json.load(f)
+def build_generation_model(model_path: str, n_threads: int | None = None) -> Any:
+    if Llama is None:
+        raise RuntimeError("llama-cpp-python is not installed. Install it to use the offline flow.")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    threads = n_threads or max(1, min(4, os.cpu_count() or 1))
+    return Llama(model_path=model_path, n_ctx=1024, n_threads=threads, verbose=False)
 
-    if not chunks:
-        print("No chunks found in input file.", file=sys.stderr)
-        sys.exit(1)
 
-    print(f"Embedding {len(chunks)} chunks via {args.server}...")
+def _normalize_embedding_payload(payload: Any) -> list[float]:
+    if isinstance(payload, list) and payload and isinstance(payload[0], list):
+        return payload[0]
+    if isinstance(payload, list) and payload and isinstance(payload[0], (int, float)):
+        return payload
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list) and data:
+            return _normalize_embedding_payload(data[0].get("embedding", []))
+    raise ValueError(f"Unsupported embedding payload shape: {type(payload)!r}")
 
+
+def embed_texts(
+    texts: list[str],
+    model_path: str | None = None,
+    server_url: str | None = None,
+    retries: int = 6,
+    model: Any | None = None,
+) -> list[list[float]]:
+    if model is not None:
+        embeddings = []
+        for text in texts:
+            response = model.create_embedding(text)
+            embeddings.append(_normalize_embedding_payload(response))
+        return embeddings
+
+    if model_path:
+        model = build_embedding_model(model_path)
+        embeddings = []
+        for text in texts:
+            response = model.create_embedding(text)
+            embeddings.append(_normalize_embedding_payload(response))
+        return embeddings
+
+    if server_url:
+        wait_for_server_ready(server_url)
+        return [get_embedding(server_url, text, retries=retries) for text in texts]
+
+    raise ValueError("Either model_path or server_url must be provided")
+
+
+def embed_query(query: str, model_path: str | None = None, server_url: str | None = None, model: Any | None = None) -> list[float]:
+    embeddings = embed_texts([query], model_path=model_path, server_url=server_url, model=model)
+    return embeddings[0]
+
+
+def load_chunks(chunks_path: str | Path) -> list[dict[str, Any]]:
+    with open(chunks_path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, list):
+        raise ValueError("Chunk file must contain a JSON array")
+    return data
+
+
+def build_index_from_chunks(
+    chunks: list[dict[str, Any]],
+    model_path: str | None = None,
+    server_url: str | None = None,
+    index_path: str | Path | None = None,
+    metadata_path: str | Path | None = None,
+) -> tuple[str, str]:
     embeddings = []
     metadata = []
     failed = []
+    embedding_model = build_embedding_model(model_path) if model_path else None
 
     for i, chunk in enumerate(chunks):
         try:
-            vec = get_embedding(args.server, chunk["text"])
+            vec = embed_texts([chunk["text"]], model_path=None, server_url=server_url, model=embedding_model)[0]
             embeddings.append(vec)
             metadata.append({
                 "id": chunk["id"],
@@ -124,49 +167,124 @@ def main():
                 "page": chunk["page"],
                 "text": chunk["text"],
             })
-        except RuntimeError as e:
-            print(f"  [{i}] FAILED ({chunk['id']}): {e}", file=sys.stderr)
-            failed.append(chunk["id"])
-            continue
-
-        if (i + 1) % 25 == 0 or (i + 1) == len(chunks):
-            print(f"  {i + 1}/{len(chunks)} embedded")
+        except Exception as exc:  # pragma: no cover - runtime path
+            failed.append((chunk["id"], str(exc)))
 
     if not embeddings:
-        print("All embeddings failed. Is llama-server running with --embedding?", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("No embeddings could be created")
 
-    # Stack into a single matrix FAISS can index. dtype must be float32 —
-    # FAISS silently misbehaves or errors on float64, which is numpy's
-    # default, so this cast is not optional.
     matrix = np.array(embeddings, dtype="float32")
     dim = matrix.shape[1]
-
-    # IndexFlatIP = exact inner-product search, no approximation. For a
-    # corpus this size (a few hundred chunks from 6 PDFs), exact search is
-    # fast enough that there's no reason to trade accuracy for the
-    # approximate-index speedup — that trade only pays off at 100k+ vectors.
-    # Inner product (not L2) because it pairs naturally with normalized
-    # embeddings for cosine-similarity-style retrieval.
     faiss.normalize_L2(matrix)
     index = faiss.IndexFlatIP(dim)
     index.add(matrix)
 
-    index_path = Path(args.index)
-    metadata_path = Path(args.metadata)
+    if index_path is None:
+        raise ValueError("index_path is required")
+    if metadata_path is None:
+        raise ValueError("metadata_path is required")
+
+    index_path = Path(index_path)
+    metadata_path = Path(metadata_path)
     index_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
 
     faiss.write_index(index, str(index_path))
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    with open(metadata_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
 
-    print(f"\nIndexed {len(embeddings)} chunks (dim={dim})")
-    if failed:
-        print(f"Failed: {len(failed)} chunks -> {failed}")
+    return str(index_path), str(metadata_path)
+
+
+def retrieve_top_k(index_path: str | Path, metadata_path: str | Path, query_vector: list[float] | np.ndarray, top_k: int = 4) -> list[dict[str, Any]]:
+    index = faiss.read_index(str(index_path))
+    with open(metadata_path, encoding="utf-8") as handle:
+        metadata = json.load(handle)
+
+    query_array = np.asarray(query_vector, dtype="float32")
+    if query_array.ndim == 1:
+        query = query_array.reshape(1, -1)
+    else:
+        query = query_array.reshape(1, -1)
+
+    faiss.normalize_L2(query)
+    _, indices = index.search(query, min(top_k, len(metadata)))
+
+    results = []
+    for idx in indices[0]:
+        if idx == -1:
+            continue
+        results.append(metadata[int(idx)])
+    return results
+
+
+def generate_answer(query: str, context_chunks: list[dict[str, Any]], model_path: str, max_tokens: int = 220) -> str:
+    if not context_chunks:
+        raise ValueError("At least one context chunk is required")
+
+    context_text = "\n\n".join(
+        f"Source: {chunk.get('source', 'unknown')} (page {chunk.get('page', 'unknown')})\n{chunk.get('text', '')}"
+        for chunk in context_chunks
+    )
+    prompt = (
+        "You are a helpful agricultural assistant. Use only the provided context to answer the user's question.\n"
+        f"Context:\n{context_text}\n\n"
+        f"Question: {query}\n"
+        "Answer briefly and clearly."
+    )
+
+    model = build_generation_model(model_path)
+    output = model(prompt, max_tokens=max_tokens, temperature=0.2, stop=["\n\nQuestion:"])
+    return output["choices"][0]["text"].strip()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--chunks", required=True, help="Path to chunks.json")
+    parser.add_argument("--index", required=True, help="Output path for FAISS index")
+    parser.add_argument("--metadata", required=True, help="Output path for chunk metadata JSON")
+    parser.add_argument("--server", default=None, help="llama-server base URL (optional)")
+    parser.add_argument("--model", default=None, help="Path to a GGUF model for local embedding/generation")
+    parser.add_argument("--query", default=None, help="Optional query to retrieve context and generate an answer")
+    parser.add_argument("--top-k", type=int, default=4, help="Number of retrieved chunks to include")
+    parser.add_argument("--max-chunks", type=int, default=None, help="Optional limit for indexing only the first N chunks")
+    args = parser.parse_args()
+
+    chunks_path = Path(args.chunks)
+    if not chunks_path.exists():
+        print(f"Chunks file not found: {chunks_path}", file=sys.stderr)
+        sys.exit(1)
+
+    chunks = load_chunks(chunks_path)
+    if not chunks:
+        print("No chunks found in input file.", file=sys.stderr)
+        sys.exit(1)
+    if args.max_chunks is not None:
+        chunks = chunks[: args.max_chunks]
+
+    if args.model is None and args.server is None:
+        print("Either --model or --server must be provided.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Building embeddings for {len(chunks)} chunks...")
+    index_path, metadata_path = build_index_from_chunks(
+        chunks,
+        model_path=args.model,
+        server_url=args.server,
+        index_path=args.index,
+        metadata_path=args.metadata,
+    )
+    print(f"Indexed {len(chunks)} chunks")
     print(f"FAISS index: {index_path}")
     print(f"Metadata:    {metadata_path}")
 
-
-if __name__ == "__main__":
+    if args.query:
+        query_vector = embed_query(args.query, model_path=args.model, server_url=args.server)
+        retrieved = retrieve_top_k(index_path, metadata_path, query_vector, top_k=args.top_k)
+        answer = generate_answer(args.query, retrieved, model_path=args.model)
+        print("\nRetrieved context:")
+        for chunk in retrieved:
+            print(f"- {chunk.get('source')} page {chunk.get('page')}")
+        print("\nAnswer:")
+        print(answer)
     main()
