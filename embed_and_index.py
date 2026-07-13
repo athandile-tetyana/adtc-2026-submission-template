@@ -12,6 +12,7 @@ and generate an answer from those chunks using the same local model.
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -196,7 +197,48 @@ def build_index_from_chunks(
     return str(index_path), str(metadata_path)
 
 
-def retrieve_top_k(index_path: str | Path, metadata_path: str | Path, query_vector: list[float] | np.ndarray, top_k: int = 4) -> list[dict[str, Any]]:
+def _normalize_query_terms(query: str) -> set[str]:
+    tokens = [token for token in re.findall(r"[a-z0-9]+", query.lower()) if token not in {"the", "and", "for", "with", "how", "what", "in", "to", "of"}]
+    expanded = set(tokens)
+    synonym_map = {
+        "maize": {"maize", "corn"},
+        "corn": {"maize", "corn"},
+        "soil": {"soil", "land"},
+        "prep": {"prep", "preparation", "prepare", "preparing"},
+        "preparation": {"prep", "preparation", "prepare", "preparing"},
+        "prepare": {"prep", "preparation", "prepare", "preparing"},
+        "preparing": {"prep", "preparation", "prepare", "preparing"},
+    }
+    for token in list(tokens):
+        expanded.update(synonym_map.get(token, {token}))
+    return expanded
+
+
+def rerank_candidates(query: str, candidates: list[dict[str, Any]], top_k: int = 4) -> list[dict[str, Any]]:
+    query_terms = _normalize_query_terms(query)
+    if not query_terms:
+        return candidates[:top_k]
+
+    scored = []
+    for candidate in candidates:
+        text = (candidate.get("text") or "").lower()
+        terms = set(re.findall(r"[a-z0-9]+", text))
+        overlap = len(query_terms & terms)
+        exact_phrase_bonus = 1 if query.lower() in text else 0
+        score = overlap * 3 + exact_phrase_bonus
+        scored.append((score, candidate))
+
+    scored.sort(key=lambda item: (-item[0], item[1].get("id", "")))
+    return [candidate for _, candidate in scored[:top_k]]
+
+
+def retrieve_top_k(
+    index_path: str | Path,
+    metadata_path: str | Path,
+    query_vector: list[float] | np.ndarray,
+    top_k: int = 4,
+    query_text: str | None = None,
+) -> list[dict[str, Any]]:
     index = faiss.read_index(str(index_path))
     with open(metadata_path, encoding="utf-8") as handle:
         metadata = json.load(handle)
@@ -208,14 +250,14 @@ def retrieve_top_k(index_path: str | Path, metadata_path: str | Path, query_vect
         query = query_array.reshape(1, -1)
 
     faiss.normalize_L2(query)
-    _, indices = index.search(query, min(top_k, len(metadata)))
+    _, indices = index.search(query, min(top_k * 4, len(metadata)))
 
     results = []
     for idx in indices[0]:
         if idx == -1:
             continue
         results.append(metadata[int(idx)])
-    return results
+    return rerank_candidates(query_text or "", results, top_k=top_k)
 
 
 def generate_answer(query: str, context_chunks: list[dict[str, Any]], model_path: str, max_tokens: int = 220) -> str:
@@ -280,7 +322,7 @@ def main():
 
     if args.query:
         query_vector = embed_query(args.query, model_path=args.model, server_url=args.server)
-        retrieved = retrieve_top_k(index_path, metadata_path, query_vector, top_k=args.top_k)
+        retrieved = retrieve_top_k(index_path, metadata_path, query_vector, top_k=args.top_k, query_text=args.query)
         answer = generate_answer(args.query, retrieved, model_path=args.model)
         print("\nRetrieved context:")
         for chunk in retrieved:

@@ -36,6 +36,29 @@ class RetrievalPipelineTests(unittest.TestCase):
 
             self.assertEqual([item["id"] for item in results], ["chunk-a", "chunk-c"])
 
+    def test_rerank_prefers_keyword_matches(self):
+        query = "maize soil preparation"
+        candidates = [
+            {"id": "chunk-a", "text": "tomato disease control"},
+            {"id": "chunk-b", "text": "maize soil preparation and planting"},
+            {"id": "chunk-c", "text": "soil preparation for vegetables"},
+        ]
+
+        reranked = embed_and_index.rerank_candidates(query, candidates, top_k=2)
+
+        self.assertEqual([item["id"] for item in reranked], ["chunk-b", "chunk-c"])
+
+    def test_rerank_uses_synonym_expansion(self):
+        query = "maize soil prep"
+        candidates = [
+            {"id": "chunk-z", "text": "corn land preparation for planting"},
+            {"id": "chunk-a", "text": "tomato disease control"},
+        ]
+
+        reranked = embed_and_index.rerank_candidates(query, candidates, top_k=1)
+
+        self.assertEqual([item["id"] for item in reranked], ["chunk-z"])
+
 
 if __name__ == "__main__":
     unittest.main()
