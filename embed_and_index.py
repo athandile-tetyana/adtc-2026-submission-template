@@ -89,7 +89,7 @@ def build_generation_model(model_path: str, n_threads: int | None = None) -> Any
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
     threads = n_threads or max(1, min(4, os.cpu_count() or 1))
-    return Llama(model_path=model_path, n_ctx=1024, n_threads=threads, verbose=False)
+    return Llama(model_path=model_path, n_ctx=4096, n_threads=threads, verbose=False)
 
 
 def _normalize_embedding_payload(payload: Any) -> list[float]:
@@ -293,10 +293,10 @@ def rerank_candidates(
             candidate_value = (candidate.get(key) or "").lower()
             if candidate_value == expected:
                 metadata_bonus += 1
-        score = overlap * 3 + exact_phrase_bonus + source_bonus + metadata_bonus + vector_score
+        score = overlap * 3 + exact_phrase_bonus + source_bonus + metadata_bonus + vector_score * 5
         scored.append((score, candidate))
 
-    scored.sort(key=lambda item: (-item[0], item[1].get("id", "")))
+    scored.sort(key=lambda item: -item[0])
     return [candidate for _, candidate in scored[:top_k]]
 
 
@@ -318,15 +318,16 @@ def retrieve_top_k(
         query = query_array.reshape(1, -1)
 
     faiss.normalize_L2(query)
-    _, indices = index.search(query, min(top_k * 4, len(metadata)))
+    scores, indices = index.search(query, min(top_k * 4, len(metadata)))
 
     results = []
-    for idx in indices[0]:
+    vector_scores = []
+    for score, idx in zip(scores[0], indices[0]):
         if idx == -1:
             continue
         results.append(metadata[int(idx)])
-    filtered = filter_candidates_by_metadata(query_text or "", results, top_k=top_k)
-    return rerank_candidates(query_text or "", filtered, top_k=top_k)
+        vector_scores.append(float(score))
+    return rerank_candidates(query_text or "", results, top_k=top_k, vector_scores=vector_scores)
 
 
 def evaluate_retrieval_variants(
@@ -353,15 +354,16 @@ def evaluate_retrieval_variants(
         metadata = json.load(handle)
 
     faiss.normalize_L2(query_array)
-    _, indices = index.search(query_array, min(top_k * 4, len(metadata)))
+    scores, indices = index.search(query_array, min(top_k * 4, len(metadata)))
     raw_results = []
-    for idx in indices[0]:
+    vector_scores = []
+    for score, idx in zip(scores[0], indices[0]):
         if idx == -1:
             continue
         raw_results.append(metadata[int(idx)])
+        vector_scores.append(float(score))
 
-    filtered = filter_candidates_by_metadata(query, raw_results, top_k=top_k)
-    reranked = rerank_candidates(query, filtered, top_k=top_k)
+    reranked = rerank_candidates(query, raw_results, top_k=top_k, vector_scores=vector_scores)
     return {
         "query": query,
         "raw_ids": [chunk.get("id") for chunk in raw_results[:top_k]],
@@ -371,16 +373,38 @@ def evaluate_retrieval_variants(
     }
 
 
-def generate_answer(query: str, context_chunks: list[dict[str, Any]], model_path: str, max_tokens: int = 220) -> str:
+# Keeps the generation prompt safely inside n_ctx=4096: ~3500 chars of context
+# is roughly 900-1000 tokens, leaving room for instructions, the question
+# (stated twice) and max_tokens of answer.
+CONTEXT_CHAR_BUDGET = 3500
+
+
+def generate_answer(
+    query: str,
+    context_chunks: list[dict[str, Any]],
+    model_path: str,
+    max_tokens: int = 220,
+    context_char_budget: int = CONTEXT_CHAR_BUDGET,
+) -> str:
     if not context_chunks:
         raise ValueError("At least one context chunk is required")
 
-    context_text = "\n\n".join(
-        f"Source: {chunk.get('source', 'unknown')} (page {chunk.get('page', 'unknown')})\n{chunk.get('text', '')}"
-        for chunk in context_chunks
-    )
+    parts: list[str] = []
+    used = 0
+    for chunk in context_chunks:
+        part = f"Source: {chunk.get('source', 'unknown')} (page {chunk.get('page', 'unknown')})\n{chunk.get('text', '')}"
+        separator = 2 if parts else 0
+        if parts and used + separator + len(part) > context_char_budget:
+            break
+        if not parts:
+            part = part[:context_char_budget]
+        parts.append(part)
+        used += separator + len(part)
+    context_text = "\n\n".join(parts)
+
     prompt = (
         "You are a helpful agricultural assistant. Use only the provided context to answer the user's question.\n"
+        f"Question: {query}\n\n"
         f"Context:\n{context_text}\n\n"
         f"Question: {query}\n"
         "Answer briefly and clearly."
