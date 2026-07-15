@@ -1,4 +1,4 @@
-*.faiss
+# *.faiss (excluded test artifacts only, not the real corpus index)
 corpus/*_metadata.json
 corpus/raw/
 model/
