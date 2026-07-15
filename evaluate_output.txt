@@ -1,0 +1,10 @@
+Using existing FAISS index: corpus/index.faiss (pass --rebuild to re-embed)
+Using existing metadata:    corpus/metadata.json
+PROMPT: What is the best time to plant maize in the Eastern Cape province of South Africa, and what soil preparation is needed?
+  raw: ['7-Vegetable production_0015', '7-Vegetable production_0014', '7-Vegetable production_0013', '7-Vegetable production_0012']
+  reranked: ['7-Vegetable production_0003', '7-Vegetable production_0014', '7-Vegetable production_0013', '7-Vegetable production_0008']
+
+PROMPT: My tomato leaves are turning yellow from the bottom up. What could be causing this and how do I treat it?
+  raw: ['7-Vegetable production_0015', '7-Vegetable production_0014', '7-Vegetable production_0013', '7-Vegetable production_0012']
+  reranked: ['7-Vegetable production_0009', '7-Vegetable production_0012', '7-Vegetable production_0008', '7-Vegetable production_0006']
+
