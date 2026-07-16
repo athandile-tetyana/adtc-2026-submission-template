@@ -411,8 +411,19 @@ def generate_answer(
     )
 
     model = build_generation_model(model_path)
-    output = model(prompt, max_tokens=max_tokens, temperature=0.2, stop=["\n\nQuestion:"])
-    return output["choices"][0]["text"].strip()
+    # tiny-aya-earth tends to loop after a complete answer, re-emitting
+    # "Answer:"/"Source:" blocks until max_tokens. Stop on those markers and
+    # apply a mild repeat penalty (this llama-cpp-python defaults to 1.0 = off).
+    output = model(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=0.2,
+        repeat_penalty=1.1,
+        stop=["\n\nQuestion:", "\nQuestion:", "\nAnswer:", "Source:"],
+    )
+    answer = output["choices"][0]["text"].strip()
+    # Stopping on "Source:" can leave a dangling "(" from a truncated citation.
+    return answer.rstrip("( ").rstrip()
 
 
 def main():
