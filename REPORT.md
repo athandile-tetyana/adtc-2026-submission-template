@@ -72,6 +72,8 @@ Raw FAISS retrieval (dense vector similarity only) was compared against the full
 
 The reranking layer corrected this in both cases, producing different, more topically appropriate top-4 sets for each distinct query. This result is the concrete justification for including a reranking stage rather than relying on vector search alone, and is treated here as a known limitation with a working mitigation, rather than a fully solved problem — a dedicated smaller embedding model (rather than reusing the generative Tiny Aya Earth model for embeddings) is the most likely further improvement, noted as a stretch goal given remaining time.
 
+**Root-cause correction (supersedes the finding above):** Later investigation showed the identical raw top-4 sets were not caused by generic content sitting close in embedding space — *all 511 vectors in the FAISS index are byte-identical*. The embedding path loaded the generative GGUF without a pooling type, so llama.cpp returned per-token embeddings, and the payload normalizer took the first row: the BOS token's embedding, which for a causal model is a constant independent of the input text. Every chunk therefore scored 1.0 against every query, raw retrieval order was tie-break noise, and the reranker's apparent wins above were purely lexical reranking over an arbitrary candidate pool. The embedding code now uses mean pooling (`LLAMA_POOLING_TYPE_MEAN`), and `build_index_from_chunks` refuses to write an index whose vectors have collapsed.
+
 ---
 
 ## Known Limitations
@@ -79,3 +81,4 @@ The reranking layer corrected this in both cases, producing different, more topi
 - RAM benchmarks for the generation context window are analytical, not directly measured, due to a development environment memory constraint (see Benchmarks section). `scripts/bench_rss.py` is included for a follow-up measured run on reference-equivalent hardware.
 - Raw dense retrieval alone shows a measurable weakness on generic/broadly-worded corpus content (see Retrieval Evaluation); the reranking layer mitigates but does not eliminate this.
 - Embeddings and generation currently share a single 3.35B model; a dedicated smaller embedding model is a likely quality improvement not yet implemented.
+- **The committed `corpus/index.faiss` contains collapsed (identical) embeddings from the BOS-token pooling bug and must be rebuilt with the corrected mean-pooling embeddings before final submission** — either via llama-server's `--embedding` mode or the fixed local path (`--rebuild`). The development Codespace does not have enough memory for the in-process rebuild. After rebuilding, the Retrieval Evaluation results and `evaluate_output.txt` should be regenerated.

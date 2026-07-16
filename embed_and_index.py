@@ -28,8 +28,10 @@ except ImportError:
     sys.exit(1)
 
 try:
+    import llama_cpp
     from llama_cpp import Llama
 except ImportError:  # pragma: no cover - optional dependency
+    llama_cpp = None
     Llama = None
 
 
@@ -80,7 +82,17 @@ def build_embedding_model(model_path: str, n_threads: int | None = None) -> Any:
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
     threads = n_threads or max(1, min(4, os.cpu_count() or 1))
-    return Llama(model_path=model_path, embedding=True, n_ctx=512, n_threads=threads, verbose=False)
+    # Without an explicit pooling type, llama.cpp returns per-token embeddings
+    # for this generative model, and downstream code used to reduce them to the
+    # first (BOS) token's vector — a constant independent of the input text.
+    return Llama(
+        model_path=model_path,
+        embedding=True,
+        n_ctx=512,
+        n_threads=threads,
+        verbose=False,
+        pooling_type=llama_cpp.LLAMA_POOLING_TYPE_MEAN,
+    )
 
 
 def build_generation_model(model_path: str, n_threads: int | None = None) -> Any:
@@ -94,7 +106,10 @@ def build_generation_model(model_path: str, n_threads: int | None = None) -> Any
 
 def _normalize_embedding_payload(payload: Any) -> list[float]:
     if isinstance(payload, list) and payload and isinstance(payload[0], list):
-        return payload[0]
+        # Per-token matrix (pooling unavailable): mean-pool rather than taking
+        # the first row — the first (BOS) token's embedding is a constant that
+        # does not depend on the input text.
+        return np.mean(payload, axis=0).tolist()
     if isinstance(payload, list) and payload and isinstance(payload[0], (int, float)):
         return payload
     if isinstance(payload, dict):
@@ -175,6 +190,14 @@ def build_index_from_chunks(
         raise RuntimeError("No embeddings could be created")
 
     matrix = np.array(embeddings, dtype="float32")
+    if len(matrix) >= 2:
+        diffs = np.abs(matrix - matrix[0]).max(axis=1)
+        if (diffs > 1e-4).mean() < 0.10:
+            raise RuntimeError(
+                "Embedding collapse detected: fewer than 10% of vectors differ from the "
+                "first one. This previously happened when per-token embeddings were "
+                "reduced to the constant BOS-token vector; refusing to write a broken index."
+            )
     dim = matrix.shape[1]
     faiss.normalize_L2(matrix)
     index = faiss.IndexFlatIP(dim)
