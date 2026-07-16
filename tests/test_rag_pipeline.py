@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import faiss
 import numpy as np
@@ -225,6 +226,53 @@ class RetrievalPipelineTests(unittest.TestCase):
 
             self.assertEqual(result["raw_ids"][0], "chunk-a")
             self.assertEqual(result["reranked_ids"][0], "chunk-b")
+
+
+class ServerEmbeddingTests(unittest.TestCase):
+    @staticmethod
+    def _response(payload):
+        response = mock.Mock()
+        response.json.return_value = payload
+        response.raise_for_status.return_value = None
+        return response
+
+    def test_get_embedding_mean_pools_per_token_server_response(self):
+        # llama-server without --pooling returns one embedding per token; the
+        # client must mean-pool them, not take the first (BOS) row.
+        per_token = [{"embedding": [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]}]
+        with mock.patch.object(embed_and_index.requests, "post", return_value=self._response(per_token)):
+            embedding = embed_and_index.get_embedding("http://localhost:8080", "maize planting")
+
+        self.assertEqual(embedding, [3.0, 4.0])
+        self.assertNotEqual(embedding, [1.0, 2.0])
+
+    def test_get_embedding_passes_flat_vector_through(self):
+        flat = [{"embedding": [0.5, 0.6, 0.7]}]
+        with mock.patch.object(embed_and_index.requests, "post", return_value=self._response(flat)):
+            embedding = embed_and_index.get_embedding("http://localhost:8080", "maize planting")
+
+        self.assertEqual(embedding, [0.5, 0.6, 0.7])
+
+    def test_build_index_rejects_collapsed_server_embeddings(self):
+        # A server returning the same vector for every text (the BOS-token
+        # collapse) must fail the index build loudly, not write a broken index.
+        constant = [{"embedding": [[0.1, 0.2, 0.3]] * 4}]
+        chunks = [
+            {"id": f"chunk-{i}", "source": "doc.pdf", "page": i, "text": f"text {i}"}
+            for i in range(5)
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with mock.patch.object(embed_and_index, "wait_for_server_ready"), \
+                    mock.patch.object(embed_and_index.requests, "post", return_value=self._response(constant)):
+                with self.assertRaisesRegex(RuntimeError, "Embedding collapse detected"):
+                    embed_and_index.build_index_from_chunks(
+                        chunks,
+                        server_url="http://localhost:8080",
+                        index_path=tmp_path / "index.faiss",
+                        metadata_path=tmp_path / "metadata.json",
+                    )
+            self.assertFalse((tmp_path / "index.faiss").exists())
 
 
 if __name__ == "__main__":

@@ -56,7 +56,12 @@ def wait_for_server_ready(server_url: str, timeout: int = 300, interval: int = 2
 
 
 def get_embedding(server_url: str, text: str, retries: int = 6) -> list[float]:
-    """Get an embedding from a llama-server /embedding endpoint."""
+    """Get an embedding from a llama-server /embedding endpoint.
+
+    The server should be started with `--embedding --pooling mean`; without
+    `--pooling`, generative models return one embedding per token and this
+    function mean-pools them client-side.
+    """
     for attempt in range(retries):
         try:
             resp = requests.post(
@@ -68,7 +73,10 @@ def get_embedding(server_url: str, text: str, retries: int = 6) -> list[float]:
             data = resp.json()
             embedding = data[0]["embedding"]
             if isinstance(embedding[0], list):
-                embedding = embedding[0]
+                # Per-token matrix (server started without --pooling): mean-pool
+                # rather than taking the first row — the first (BOS) token's
+                # embedding is a constant that does not depend on the input text.
+                embedding = np.mean(embedding, axis=0).tolist()
             return embedding
         except (requests.RequestException, KeyError, IndexError) as exc:
             if attempt == retries - 1:
@@ -161,6 +169,23 @@ def load_chunks(chunks_path: str | Path) -> list[dict[str, Any]]:
     return data
 
 
+def _assert_no_embedding_collapse(matrix: np.ndarray) -> None:
+    """Reject embedding matrices whose vectors are (near-)identical.
+
+    Guards every index build, whichever embedding path produced the vectors
+    (local llama-cpp-python or the llama-server HTTP endpoint).
+    """
+    if len(matrix) < 2:
+        return
+    diffs = np.abs(matrix - matrix[0]).max(axis=1)
+    if (diffs > 1e-4).mean() < 0.10:
+        raise RuntimeError(
+            "Embedding collapse detected: fewer than 10% of vectors differ from the "
+            "first one. This previously happened when per-token embeddings were "
+            "reduced to the constant BOS-token vector; refusing to write a broken index."
+        )
+
+
 def build_index_from_chunks(
     chunks: list[dict[str, Any]],
     model_path: str | None = None,
@@ -190,14 +215,7 @@ def build_index_from_chunks(
         raise RuntimeError("No embeddings could be created")
 
     matrix = np.array(embeddings, dtype="float32")
-    if len(matrix) >= 2:
-        diffs = np.abs(matrix - matrix[0]).max(axis=1)
-        if (diffs > 1e-4).mean() < 0.10:
-            raise RuntimeError(
-                "Embedding collapse detected: fewer than 10% of vectors differ from the "
-                "first one. This previously happened when per-token embeddings were "
-                "reduced to the constant BOS-token vector; refusing to write a broken index."
-            )
+    _assert_no_embedding_collapse(matrix)
     dim = matrix.shape[1]
     faiss.normalize_L2(matrix)
     index = faiss.IndexFlatIP(dim)
